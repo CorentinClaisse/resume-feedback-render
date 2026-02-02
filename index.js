@@ -6,6 +6,7 @@ import pdfParse from 'pdf-parse';
 import mammoth from 'mammoth';
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'fs/promises';
+import pg from 'pg';
 
 dotenv.config();
 
@@ -15,11 +16,57 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
+// PostgreSQL connection
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Test database connection
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('❌ Database connection failed:', err);
+  } else {
+    console.log('✅ Database connected:', res.rows[0].now);
+  }
+});
+
 app.use(cors());
 app.use(express.json());
 
 // Store resume contexts per session (in production, use Redis/DB)
 const sessionStore = new Map();
+
+// Analytics logging function
+async function logAnalytics(data) {
+  try {
+    await pool.query(`
+      INSERT INTO analytics (
+        session_id, event_type, file_size, file_type, status,
+        overall_score, readability_score, clarity_score, formatting_score,
+        chat_message_count, error_message, ip_address, user_agent
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    `, [
+      data.sessionId || null,
+      data.eventType || 'analysis',
+      data.fileSize || null,
+      data.fileType || null,
+      data.status || 'success',
+      data.overallScore || null,
+      data.readabilityScore || null,
+      data.clarityScore || null,
+      data.formattingScore || null,
+      data.chatMessageCount || 0,
+      data.errorMessage || null,
+      data.ipAddress || null,
+      data.userAgent || null
+    ]);
+  } catch (error) {
+    console.error('Analytics logging error:', error);
+    // Don't fail the request if logging fails
+  }
+}
 
 // Recruiter persona and evaluation criteria
 const RECRUITER_PROMPT = `You are Corentin Claisse, an expert technical recruiter specializing in sales, partnerships, and go-to-market roles in fintech, fraud prevention, and payments. You have 8+ years of experience at companies like Plaid, Riskified, PayPal, Public.com, and Taboola.
@@ -190,6 +237,21 @@ ${resumeText}`
       );
     }
 
+    // Log analytics (anonymized)
+    await logAnalytics({
+      sessionId,
+      eventType: 'analysis',
+      fileSize: req.file.size,
+      fileType: req.file.mimetype.includes('pdf') ? 'PDF' : 'DOCX',
+      status: 'success',
+      overallScore: analysisResult.overallScore,
+      readabilityScore: analysisResult.readability?.score || null,
+      clarityScore: analysisResult.clarity?.score || null,
+      formattingScore: analysisResult.formatting?.score || null,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent']
+    });
+
     // Return results with session ID
     res.json({
       ...analysisResult,
@@ -198,6 +260,19 @@ ${resumeText}`
 
   } catch (error) {
     console.error('Analysis error:', error);
+    
+    // Log error analytics
+    await logAnalytics({
+      sessionId: null,
+      eventType: 'error',
+      fileSize: req.file?.size || null,
+      fileType: req.file?.mimetype || null,
+      status: 'error',
+      errorMessage: error.message,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent']
+    });
+    
     res.status(500).json({ 
       error: 'Failed to analyze resume',
       details: error.message 
@@ -277,6 +352,91 @@ Now answer my questions about this resume and feedback.`
   }
 });
 
+// Admin authentication middleware
+function authenticateAdmin(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const adminPassword = process.env.ADMIN_PASSWORD || 'changeme123';
+  
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.substring(7);
+    if (token === adminPassword) {
+      return next();
+    }
+  }
+  
+  return res.status(401).json({ error: 'Unauthorized' });
+}
+
+// Serve admin dashboard
+app.get('/admin', (req, res) => {
+  res.sendFile('/admin.html', { root: '.' });
+});
+
+// Admin stats API
+app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
+  try {
+    // Get today's stats
+    const todayStats = await pool.query(`
+      SELECT 
+        COUNT(*) as total,
+        COUNT(CASE WHEN status = 'success' THEN 1 END) as successful,
+        AVG(overall_score) as avg_score
+      FROM analytics
+      WHERE DATE(timestamp) = CURRENT_DATE
+        AND event_type = 'analysis'
+    `);
+    
+    // Get all-time stats
+    const allTimeStats = await pool.query(`
+      SELECT COUNT(*) as total
+      FROM analytics
+      WHERE event_type = 'analysis'
+    `);
+    
+    // Get recent analyses (last 20)
+    const recentAnalyses = await pool.query(`
+      SELECT 
+        timestamp, file_type, file_size, status,
+        overall_score, readability_score, clarity_score, formatting_score
+      FROM analytics
+      WHERE event_type = 'analysis'
+      ORDER BY timestamp DESC
+      LIMIT 20
+    `);
+    
+    // Get score distribution
+    const scoreDistribution = await pool.query(`
+      SELECT 
+        COUNT(CASE WHEN overall_score >= 80 THEN 1 END) as excellent,
+        COUNT(CASE WHEN overall_score >= 60 AND overall_score < 80 THEN 1 END) as good,
+        COUNT(CASE WHEN overall_score < 60 THEN 1 END) as needs_work
+      FROM analytics
+      WHERE event_type = 'analysis'
+        AND status = 'success'
+    `);
+    
+    const today = todayStats.rows[0];
+    const totalToday = parseInt(today.total) || 0;
+    const successful = parseInt(today.successful) || 0;
+    const successRate = totalToday > 0 ? Math.round((successful / totalToday) * 100) : 0;
+    
+    res.json({
+      stats: {
+        totalToday,
+        successRate,
+        avgScore: today.avg_score ? Math.round(today.avg_score) : 0,
+        totalAllTime: parseInt(allTimeStats.rows[0].total) || 0
+      },
+      recentAnalyses: recentAnalyses.rows,
+      scoreDistribution: scoreDistribution.rows[0]
+    });
+    
+  } catch (error) {
+    console.error('Admin stats error:', error);
+    res.status(500).json({ error: 'Failed to load stats' });
+  }
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -288,4 +448,3 @@ app.listen(PORT, () => {
   console.log(`✅ Resume Feedback API running on port ${PORT}`);
   console.log(`🏥 Health check: http://localhost:${PORT}/api/health`);
 });
-
