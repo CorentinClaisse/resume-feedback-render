@@ -117,6 +117,7 @@ app.post('/api/analyze-resume', upload.single('resume'), async (req, res) => {
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 4000,
+      temperature: 0.3, // Lower temperature for more consistent scoring
       system: RECRUITER_PROMPT,
       messages: [
         {
@@ -252,6 +253,7 @@ Now answer my questions about this resume and feedback.`
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2000,
+      temperature: 0.7, // Higher temperature for more natural, conversational responses
       system: RECRUITER_PROMPT + '\n\nYou are now in a chat conversation helping the user understand their resume feedback. Be conversational, helpful, and specific. Reference the resume and analysis directly.',
       messages: conversationMessages
     });
